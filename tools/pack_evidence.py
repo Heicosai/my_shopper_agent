@@ -58,6 +58,10 @@ EV = HOME / "dtlab" / "evidence"
 MARKER = HOME / "dtlab" / ".run_started"   # touched at FIRST agent-run start
 SANDBOX_MARKER = HOME / "dtlab" / "sandbox.txt"   # smoke test / fallback run
 RUNS = HOME / "dtlab" / "runs"
+# Superseded agent runs (a student redoing a condition). The dirs stay on
+# the codespace; the INDEX rides along in every pack so a redo is visible
+# in the research data instead of looking like a single clean run.
+RUNS_HISTORY = HOME / "dtlab" / "runs_history"
 # quarantine root: human picks, verdicts, and held persona files live
 # under ~/dtlab/quarantine/ (every agent path is barred from it); packs
 # from before the move fall back to the legacy locations
@@ -105,6 +109,11 @@ CFG = load_config()
 ID_RE = re.compile(CFG.get("DTLAB_ID_PATTERN", r"DT[0-9]{4}-[0-9]{3}"))
 ASIN_RE = re.compile(r"[A-Z0-9]{10}")
 CONDITIONS = ("persona", "ablated", "nohistory")
+# The 2x2's grounding pair specifically. Distinct from CONDITIONS, which
+# is the allowlist of every valid condition: the 2x2 predates the
+# purchase-history factor and pairs persona against ablated only, so its
+# day-balance checks must name that pair rather than "all valid values".
+PAIR_CONDITIONS = ("persona", "ablated")
 TIERS = ("economy", "frontier")
 
 
@@ -928,13 +937,42 @@ def main():
              "validate normally")
     runs_present = [rn for rn in all_run_dirs if rn not in sandbox_runs]
     ablation = bool(runs_present)
+
+    # ---- which design is this pack? ------------------------------------
+    # Read the recorded conditions FIRST: the design has to be identified
+    # before any design-specific assertion runs, or a three-condition pack
+    # gets measured against the 2x2's rules and fails for missing a run
+    # that was never part of its design.
+    _conds_present = {}
+    _tiers_present = {}
+    for _rn in runs_present:
+        _cf = RUNS / _rn / "condition.txt"
+        _tf = RUNS / _rn / "tier.txt"
+        if _cf.exists():
+            _conds_present[_rn] = _cf.read_text(encoding="utf-8").strip()
+        if _tf.exists():
+            _tiers_present[_rn] = _tf.read_text(encoding="utf-8").strip()
+
+    # THREE-CONDITION design (the plan of record from 7 Sept): one run per
+    # grounding condition on a single fixed tier — persona (questionnaire
+    # + history), ablated (history only), nohistory (questionnaire only).
+    # There is no second tier and no day-2 pair, so the 2x2's run-count,
+    # day-pair and tier-counterbalance rules do not apply to it.
+    three_cond = (len(runs_present) == 3
+                  and sorted(_conds_present.values()) == sorted(CONDITIONS)
+                  and len(set(_tiers_present.values())) <= 1)
+
     # per-run tier files mark the four-run 2x2; their absence marks a
     # legacy two-run pack (backward compatibility)
-    four_run = ablation and any((RUNS / rn / "tier.txt").exists()
-                                for rn in runs_present)
-    expected_runs = tuple(
-        rn for rn in (RUN_NAMES if four_run else ("run1", "run2"))
-        if rn not in sandbox_runs)
+    four_run = (not three_cond) and ablation and any(
+        (RUNS / rn / "tier.txt").exists() for rn in runs_present)
+    if three_cond:
+        expected_runs = tuple(rn for rn in runs_present
+                              if rn not in sandbox_runs)
+    else:
+        expected_runs = tuple(
+            rn for rn in (RUN_NAMES if four_run else ("run1", "run2"))
+            if rn not in sandbox_runs)
     # per-run HERMES_HOME layout marker: any run carrying its own home
     # was launched with the per-run treatment delivery; packs without it
     # predate the layout and use the legacy global transcript pool
@@ -1037,11 +1075,12 @@ def main():
             need(cond in CONDITIONS,
                  f"ablation factor: {rn}/condition.txt missing or invalid")
             conds[rn] = cond
-            if four_run:
+            if four_run or three_cond:
                 tier = ((rdir / "tier.txt").read_text().strip()
                         if (rdir / "tier.txt").exists() else "")
                 need(tier in TIERS,
-                     f"2x2 design: {rn}/tier.txt missing or invalid")
+                     f"{'2x2' if four_run else 'three-condition'} design: "
+                     f"{rn}/tier.txt missing or invalid")
                 tiers[rn] = tier
             sdir = staging / rn
             sdir.mkdir(exist_ok=True)
@@ -1069,7 +1108,7 @@ def main():
             for day, pair in ((1, ("run1", "run2")), (2, ("run3", "run4"))):
                 got = {conds[rn] for rn in pair if rn in conds}
                 if len([rn for rn in pair if rn in conds]) == 2:
-                    need(got == set(CONDITIONS),
+                    need(got == set(PAIR_CONDITIONS),
                          f"2x2 design: day-{day} runs must be one persona "
                          f"and one ablated run (got "
                          f"{ {rn: conds[rn] for rn in pair if rn in conds} })")
@@ -1086,8 +1125,17 @@ def main():
                      "2x2 design: the two lab days must run DIFFERENT "
                      "tiers (tier order is counterbalanced across days; "
                      f"got {day_tier})")
+        elif three_cond:
+            need(sorted(conds.values()) == sorted(CONDITIONS),
+                 "three-condition design: the three runs must be one "
+                 "persona, one ablated and one nohistory run (got "
+                 f"{conds})")
+            _t = {t for t in tiers.values() if t}
+            need(len(_t) <= 1,
+                 "three-condition design: every run must share one model "
+                 f"tier (got {sorted(_t)})")
         elif len(conds) == 2:
-            need(set(conds.values()) == set(CONDITIONS),
+            need(set(conds.values()) == set(PAIR_CONDITIONS),
                  f"ablation factor: the two runs must be one persona and "
                  f"one ablated run (got {conds})")
 
@@ -1115,15 +1163,45 @@ def main():
                 reset_lines.append(json.loads(ln))
             except json.JSONDecodeError:
                 reset_lines.append({"raw": ln})
+    # ---- agent-run redos: how many attempts each slot really took ----
+    agent_attempts = None
+    if RUNS_HISTORY.is_dir():
+        hist_lines = []
+        hjsonl = RUNS_HISTORY / "history.jsonl"
+        if hjsonl.exists():
+            for ln in hjsonl.read_text(encoding="utf-8").splitlines():
+                if not ln.strip():
+                    continue
+                try:
+                    hist_lines.append(json.loads(ln))
+                except json.JSONDecodeError:
+                    hist_lines.append({"raw": ln})
+        archived = sorted(d.name for d in RUNS_HISTORY.iterdir()
+                          if d.is_dir())
+        if hist_lines or archived:
+            by_run = {}
+            for rec in hist_lines:
+                key = f"run{rec.get('run')}"
+                by_run[key] = by_run.get(key, 0) + 1
+            agent_attempts = {
+                # 1 live run + however many were superseded
+                "superseded_by_run": by_run,
+                "archived_dirs": archived,
+                "records": hist_lines,
+            }
+            warn(f"{len(archived)} superseded agent run(s) archived on "
+                 "this codespace — the live runs are the ones packed; "
+                 "attempt counts are recorded in the manifest")
+
     human_attempts = None
     if committed_m:
         human_attempts = {"committed": len(committed_m),
                           "resets": reset_lines}
         need(len(committed_m) <= len(reset_lines) + 1,
              f"{len(committed_m)} committed human-session attempts but "
-             f"only {len(reset_lines)} TA reset record(s) — the session "
-             "happens ONCE; tell a TA (dtlab-shop --reset-attempt is "
-             "the only re-run path)")
+             f"only {len(reset_lines)} archive record(s) — every redo "
+             "archives the attempt it replaces, so a missing record "
+             "means files were moved by hand; tell a TA")
     # the sid the human session was LOGGED under must be the sid this
     # pack belongs to — a typo'd --student-id would silently
     # desynchronize the human task order from every agent run
@@ -1434,7 +1512,7 @@ def main():
         elif ablation:
             need(all(verdicts.get(f"{t}_{c}") in VERDICTS
                      for t in TASK_IDS
-                     for c in CONDITIONS),
+                     for c in PAIR_CONDITIONS),
                  "comparison.md: the ablation design needs a 'Verdict: "
                  "better|identical|equivalent|inferior' line for every "
                  "task in BOTH runs — use templates/comparison_ablation.md")
@@ -1862,6 +1940,26 @@ def main():
                 "manipulation_check_cited_codes": cited_by_run,
                 "cart_verified": cart_verified,
             }
+        elif three_cond:
+            ablation_meta = {
+                "enabled": True,
+                "design": "3cond",
+                "run_conditions": conds,
+                "run_tiers": tiers,
+                "run_started_at": started,
+                "head_to_head": head_to_head,
+                # every pairwise contrast the design supports: the
+                # questionnaire effect (persona vs ablated), the history
+                # effect (persona vs nohistory), and the two ablations
+                # against each other
+                "pick_overlap": {
+                    "persona_vs_ablated": overlap("persona", "ablated"),
+                    "persona_vs_nohistory": overlap("persona", "nohistory"),
+                    "ablated_vs_nohistory": overlap("ablated", "nohistory"),
+                },
+                "manipulation_check_cited_codes": cited_by_run,
+                "cart_verified": cart_verified,
+            }
         else:
             orderfile = HOME / "dtlab" / "persona_order.txt"
             ablation_meta = {
@@ -2203,6 +2301,7 @@ def main():
         "checkout_attempts": checkout_attempts,
         "interventions_by_run": interventions_by_run,
         "human_attempts": human_attempts,
+        "agent_attempts": agent_attempts,
         "demographic_citations_by_run": demographic_citations,
         # the typed pre-run acknowledgment (consent capture layer 2 of 3,
         # research_protocol §3) — recorded by dtlab-start, audited here

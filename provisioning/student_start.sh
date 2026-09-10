@@ -44,6 +44,14 @@ DAY1_TIER="${DTLAB_DAY1_TIER:-economy}"
 DAY2_TIER="${DTLAB_DAY2_TIER:-frontier}"
 SANDBOX="${DTLAB_SANDBOX:-0}"
 RUNSDIR="$HOME/dtlab/runs"
+# Every run the student ever completes is kept here, one dir per attempt,
+# named run<slot>_attempt<k>_<UTC stamp>. A redo MOVES the old run dir in
+# here whole rather than overwriting it: re-running a condition is
+# allowed as often as the student likes, but no attempt is ever lost.
+# Deliberately OUTSIDE $RUNSDIR — the packer enumerates run1..run4 by
+# name, so an archived attempt left inside runs/ would either be missed
+# or double-counted depending on the check.
+HISTDIR="$HOME/dtlab/runs_history"
 # ---- quarantine root (D3): everything the agent must never see —
 # human picks, verdicts, held persona files — lives under ONE root,
 # ~/dtlab/quarantine/, which every SOUL bars by path. Migration shim:
@@ -676,6 +684,54 @@ PY
       fi
     done
   }
+  # ---- redo support ----------------------------------------------
+  # A student may re-run any condition as often as they like. The run
+  # being replaced is MOVED into $HISTDIR whole (never deleted, never
+  # overwritten) and recorded append-only, so every attempt survives and
+  # the attempt count stays auditable at pack time.
+  archived_count() {   # $1=slot -> how many attempts already archived
+    local n="$1" c=0 d
+    for d in "$HISTDIR/run${n}_attempt"*; do
+      [ -d "$d" ] && c=$((c + 1))
+    done
+    echo "$c"
+  }
+  archive_run_to_history() {   # $1=slot; moves runN out of runs/
+    local n="$1" src="$RUNSDIR/run$1" k stamp dest cond tier hist f
+    [ -d "$src" ] || return 0
+    k=$(( $(archived_count "$n") + 1 ))
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dest="$HISTDIR/run${n}_attempt${k}_${stamp}"
+    mkdir -p "$HISTDIR"
+    # sweep this run's workspace artifacts in with it, so the archived
+    # attempt is complete AND the replacement run starts with a clean
+    # log (an ablated agent must never read a persona-citing log)
+    for f in decision_log.md agent_picks.csv; do
+      if [ -f "$WS/$f" ] && [ ! -f "$src/$f" ]; then mv "$WS/$f" "$src/$f"; fi
+    done
+    mv "$src" "$dest" || return 1
+    cond=$(cat "$dest/condition.txt" 2>/dev/null || echo "?")
+    tier=$(cat "$dest/tier.txt" 2>/dev/null || echo "?")
+    hist=$(cat "$dest/history.txt" 2>/dev/null || echo "?")
+    printf '{"archived_at_utc":"%s","run":%s,"attempt":%s,"condition":"%s","history":"%s","tier":"%s","dir":"%s"}\n' \
+      "$(date -u +%FT%TZ)" "$n" "$k" "$cond" "$hist" "$tier" \
+      "$(basename "$dest")" >> "$HISTDIR/history.jsonl"
+    if [ ! -f "$HISTDIR/HISTORY.md" ]; then
+      {
+        echo "# Your run history"
+        echo ""
+        echo "Every agent run you have completed, newest last. Nothing here"
+        echo "is ever deleted — redoing a run moves the old one in here."
+        echo ""
+        echo "| archived (UTC) | run | attempt | persona | history | tier | folder |"
+        echo "|---|---|---|---|---|---|---|"
+      } > "$HISTDIR/HISTORY.md"
+    fi
+    printf '| %s | %s | %s | %s | %s | %s | %s |\n' \
+      "$(date -u +%FT%TZ)" "$n" "$k" "$cond" "$hist" "$tier" \
+      "$(basename "$dest")" >> "$HISTDIR/HISTORY.md"
+    ok "run $n ($tier, $cond, history $hist) archived to runs_history/$(basename "$dest")"
+  }
   if [ "$BOOTSTRAP_RUN" = "1" ]; then
     :   # Phase 0: no run to resume — the bootstrap session has no runN
   elif [ -z "$RUN" ]; then
@@ -684,13 +740,37 @@ PY
       note "run 4 was set up but never started — resuming it"
       archive_prev_of 4
     else
-      read -rp "All four runs already started. Resume run 4 ($(prev_desc 4))? [y/N] " R4
-      case "$R4" in
-        [yY]*) RUN=4 ;;
-        *) bad "all four agent runs are done — next steps: dtlab-verdict, then dtlab-pack"
+      echo ""
+      echo "All four run slots are used:"
+      for i in 1 2 3 4; do
+        printf '  run %s  %s\n' "$i" "$(prev_desc "$i")"
+      done
+      echo ""
+      echo "You can run again as often as you like. Whatever you replace is"
+      echo "MOVED to ~/dtlab/runs_history/ — kept on file, never deleted."
+      echo "The new run uses your CURRENT dtlab-persona / dtlab-history /"
+      echo "dtlab-tier settings, so set those before choosing."
+      echo ""
+      echo "  1-4  redo that run slot"
+      echo "  a    archive all four and start a fresh set"
+      echo "  r    resume run 4 as it stands (it was interrupted mid-run)"
+      echo "  q    quit — go on to dtlab-verdict, then dtlab-pack"
+      echo ""
+      read -rp "Which? [1-4/a/r/q] " PICK
+      case "$PICK" in
+        [1-4])
+          archive_run_to_history "$PICK" || { bad "could not archive run $PICK — nothing changed"; exit 1; }
+          RUN="$PICK" ;;
+        [aA]*)
+          for i in 1 2 3 4; do
+            archive_run_to_history "$i" || { bad "could not archive run $i — stopped part-way"; exit 1; }
+          done
+          RUN=1 ;;
+        [rR]*) RUN=4 ;;
+        *) note "all four runs stand as they are — nothing archived"
            echo ""
-           echo -e "${RED}Fix the [!!] items above, then run dtlab-start again.${NC}"
-           exit 1 ;;
+           echo "Next steps: dtlab-verdict, then dtlab-pack"
+           exit 0 ;;
       esac
     fi
   elif [ "$RUN" -gt 1 ]; then
@@ -1127,26 +1207,39 @@ case "$PM" in
   [yY]*) ok "no saved payment methods in the lab browser profile" ;;
   *) echo -e "${RED}Remove them now (amazon.in > Your Account > Payment options; also check the browser's own autofill), then re-run dtlab-start. The agent never touches checkout, but a clean profile is the belt to that suspender.${NC}"; exit 1 ;;
 esac
-# Calendar guard: runs 3-4 are DAY-2 runs; burning all four on day 1
-# breaks the tier-by-day design. Soft gate — a TA-approved early run
-# passes with a typed EARLY (remembered for the rest of the day pair).
+# Calendar guard. This exists for exactly ONE reason: to stop a student
+# burning the day-2 runs on day 1 when day 2 runs a DIFFERENT model
+# tier, which is what the tier-by-day counterbalance depends on.
+#
+# It is therefore conditioned on the tier actually differing, not on the
+# run number. Under the three-condition design every run is the same
+# fixed tier, so there is no second tier to protect — and a run-number
+# gate there does nothing but stop a student finishing legitimate work
+# in one sitting, which is what it did to the first cohort that tried.
+# Same day AND same tier as run 1 = nothing to guard, so say nothing.
+D1TIER="$(cat "$RUNSDIR/run1/tier.txt" 2>/dev/null || true)"
 if [ -n "$RUN" ] && [ "$RUN" -ge 3 ] \
-   && [ ! -f "$HOME/dtlab/.day2_early_ok" ]; then
+   && [ ! -f "$HOME/dtlab/.day2_early_ok" ] \
+   && [ -n "$D1TIER" ] && [ "$TIER" != "$D1TIER" ]; then
   TODAY_IST="$(TZ=Asia/Kolkata date +%F)"
   D1DATE="$(cat "$RUNSDIR/run1/ist_date.txt" 2>/dev/null || true)"
   if [ -n "$D1DATE" ] && [ "$TODAY_IST" = "$D1DATE" ]; then
-    echo -e "${YEL}Runs 3-4 are DAY-2 (frontier) runs, but today is still"
-    echo -e "day 1's calendar date in IST ($D1DATE). All four runs on one"
-    echo -e "day would break the tier-by-day design. Type EARLY only if a"
-    echo -e "TA approved running day-2 early; anything else aborts.${NC}"
+    echo -e "${YEL}Run $RUN would run the $TIER tier, but run 1 ran"
+    echo -e "$D1TIER and today is still day 1's calendar date in IST"
+    echo -e "($D1DATE). Both tiers on one day breaks the tier-by-day"
+    echo -e "counterbalance. Type EARLY only if a TA approved running"
+    echo -e "day-2 early; anything else aborts.${NC}"
     read -rp "> " OK3
-    if [ "$OK3" = "EARLY" ]; then
-      echo EARLY > "$HOME/dtlab/.day2_early_ok"
-      note "TA-approved early day-2 start recorded"
-    else
-      echo -e "${RED}Come back on lab day 2 for runs 3-4.${NC}"
-      exit 1
-    fi
+    # accepted in any case: a student who types "Early" has given the
+    # same answer, and losing a run to the shift key helps nobody
+    case "$OK3" in
+      [eE][aA][rR][lL][yY])
+        echo EARLY > "$HOME/dtlab/.day2_early_ok"
+        note "TA-approved early day-2 start recorded" ;;
+      *)
+        echo -e "${RED}Come back on lab day 2 for runs 3-4.${NC}"
+        exit 1 ;;
+    esac
   fi
 fi
 if [ -n "$COND" ]; then
